@@ -49,7 +49,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX
 SHOW GRANTS FOR 'fhir_app'@'localhost';
 ```
 
-If the user already exists, run the `GRANT` and `SHOW GRANTS` statements. The app needs these permissions to create and evolve tables, detect unchanged records, update changed records, and replace their child rows.
+If the user already exists, run the `GRANT` and `SHOW GRANTS` statements. The app needs these permissions to create and evolve tables, detect unchanged records, and save parent history and child rows.
 
 The repository includes a tracked `.env` template with placeholder values. Keep those placeholders in the committed file. For your machine's actual credentials, copy `.env` to `.env.local` and edit `.env.local`; it is excluded by `.gitignore` and is loaded before `.env`. Shell environment variables take precedence over both files.
 
@@ -101,9 +101,15 @@ Open <http://127.0.0.1:8000>. Keep the terminal running while you use the app. S
 
 For example, the included `Bundle_json.json` and `Bundle_json2.json` can be selected together by choosing their containing folder. The folder picker includes `.json` files in the selected folder; place only files you intend to process there.
 
-Tables are created automatically. Parent tables have names such as `fhir_Patient_parent`; child tables have names such as `fhir_Patient_Identifier`. FHIR IDs are stored as `VARCHAR(255)`, scalar strings as `TEXT`, and arrays/objects (including the original resource snapshot) as JSON. Existing JSON-typed string columns are migrated when the app next saves.
+Tables are created automatically. Parent tables have names such as `fhir_Patient_parent`; array tables have names such as `fhir_Patient_Name` and `fhir_Patient_Name_Given`. Objects are flattened into their containing row. A field containing a single string in an array is stored as text in its containing row; other arrays are represented by separate tables, including arrays nested inside other arrays. Scalar values are stored as text, except for array positions; the original resource snapshot is the only JSON column.
 
-When a resource has an ID, an unchanged resource is skipped on later saves. If its content changes, its parent row is updated and its child rows are replaced. Resources without IDs cannot be matched across saves, so they are appended. The UI reports inserted, updated, and unchanged row counts.
+Each parent and array row carries `__resource_key`, including resources without an ID. Array rows also carry `id`, `meta_versionid`, `__node_id`, `__parent_node_id`, and `__array_index`. Join an array row to its resource using `__resource_key` and `meta_versionid` (using a null-safe version comparison when a resource has no version). Join nested array rows to their containing array row using `__resource_key`, `meta_versionid`, and `__parent_node_id = __node_id`. Top-level array rows have a null `__parent_node_id`. Array position distinguishes repeated identical entries and preserves their order. Empty arrays have no rows and can be distinguished from absent arrays using the snapshot.
+
+When a resource has an ID, parent history is retained using SCD type 2. A supplied `meta.versionId` identifies the parent version; otherwise, the resource hash detects changes and the loader generates a version. Child rows are retained and deduplicated, and receive the same version as their parent. Resources without IDs cannot be matched across saves, so they are appended. Upload different versions of the same resource ID separately. The UI reports inserted, updated, and unchanged row counts.
+
+For example, `given: ["Taylor"]` is stored as `Taylor` in the name row; `given: ["Taylor", "Lee"]` produces two rows in the given-name table. Queries must check both locations because the same field can have different cardinalities in different resources or versions. Reprocessing an unchanged parent does not add duplicate child rows. Existing records are not converted automatically: unchanged resources are skipped, and existing child rows are retained. This schema is intended for an empty database or a database already created with the normalized schema; old JSON-valued columns and rows are not migrated automatically.
+
+FHIR `reference` fields in parent and child rows contain the reference's ID rather than the resource type or URL (for example, `Encounter/e1` becomes `e1`). Versioned references retain the resource ID, not the version. Contained references and URNs are reduced to their local identifier; those identifiers are not necessarily IDs in a separate resource table. The original reference remains available in the parent snapshot. Already-loaded rows are not rewritten when this extraction behavior changes.
 
 ## Troubleshooting
 

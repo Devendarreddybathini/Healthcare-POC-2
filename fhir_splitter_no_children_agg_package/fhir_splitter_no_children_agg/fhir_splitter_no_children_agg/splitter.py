@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 import json
+import hashlib
+import uuid
 from typing import Any, Dict, List, Tuple
 
 def _to_pascal(name: str) -> str:
@@ -18,6 +20,19 @@ def _normalize_child_basename(resource: str, child_key: str) -> str:
 def _normalize_child_filename(resource: str, child_key: str) -> str:
     return f"Output/{resource}/{_normalize_child_basename(resource, child_key)}.json"
 
+def _reference_to_id(ref: Any) -> Any:
+    if not isinstance(ref, str):
+        return ref
+    if ref.startswith("#") and len(ref) > 1:
+        return ref[1:]
+    value = ref.strip().split("#")[0].split("?")[0]
+    if value.startswith("urn:"):
+        return value.rsplit(":", 1)[-1]
+    segments = [s for s in value.split("/") if s]
+    if "_history" in segments:
+        segments = segments[:segments.index("_history")]
+    return segments[-1] if segments else ref
+
 def split_parent_children(obj: Dict[str, Any]) -> Dict[str, Any]:
     res_type = obj.get("resourceType", "Unknown")
     id_val = obj.get("id"); mv = None
@@ -25,7 +40,11 @@ def split_parent_children(obj: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(meta, dict):
         mv = meta.get("versionid") or meta.get("versionId")
 
-    parent_row: Dict[str, Any] = {"resourceType": res_type}
+    resource_key = (
+        hashlib.sha256(json.dumps([res_type, id_val], ensure_ascii=False).encode("utf-8")).hexdigest()
+        if id_val is not None else uuid.uuid4().hex
+    )
+    parent_row: Dict[str, Any] = {"resourceType": res_type, "__resource_key": resource_key}
     if id_val is not None: parent_row["id"] = id_val
     if mv is not None: parent_row["meta_versionid"] = mv
     parent_row["__snapshot"] = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
@@ -36,48 +55,50 @@ def split_parent_children(obj: Dict[str, Any]) -> Dict[str, Any]:
         if name not in children: children[name] = []
         return children[name]
 
-    def flatten(node: Any, prefix: tuple, out: Dict[str, Any]):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                keyp = prefix + (k,)
-                if isinstance(v, list):
-                    out["_".join(keyp)] = json.dumps(v, ensure_ascii=False)
-                elif isinstance(v, dict):
-                    flatten(v, keyp, out)
-                else:
-                    out["_".join(keyp)] = v
-        return out
+    def node_id(location: tuple) -> str:
+        identity = [resource_key, location]
+        raw = json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def emit(items, path: tuple):
-        table = "_".join(path); rows = ensure(table)
-        for it in items:
-            row: Dict[str, Any] = {}
+    def flatten(node: dict, path: tuple, location: tuple, row: dict, parent_node_id: str | None):
+        for key, value in node.items():
+            field_path = path + (key,)
+            field_location = location + (key,)
+            if isinstance(value, dict):
+                flatten(value, field_path, field_location, row, parent_node_id)
+            elif isinstance(value, list):
+                if len(value) == 1 and isinstance(value[0], str):
+                    row["_".join(field_path)] = value[0]
+                else:
+                    emit(value, field_path, field_location, parent_node_id)
+            else:
+                row["_".join(field_path)] = _reference_to_id(value) if key == "reference" else value
+
+    def emit(items: list, path: tuple, location: tuple, parent_node_id: str | None):
+        rows = ensure("_".join(path))
+        for index, item in enumerate(items):
+            item_location = location + (index,)
+            current_node_id = node_id(item_location)
+            row: Dict[str, Any] = {
+                "__node_id": current_node_id,
+                "__parent_node_id": parent_node_id,
+                "__array_index": index,
+                "__resource_key": resource_key,
+            }
             if id_val is not None: row["id"] = id_val
             if mv is not None: row["meta_versionid"] = mv
-            if isinstance(it, dict):
-                for k, v in it.items():
-                    keyp = path + (k,)
-                    if isinstance(v, list):
-                        row["_".join(keyp)] = json.dumps(v, ensure_ascii=False)
-                    elif isinstance(v, dict):
-                        row.update(flatten(v, keyp, {}))
-                    else:
-                        row["_".join(keyp)] = v
+            if isinstance(item, dict):
+                flatten(item, path, item_location, row, current_node_id)
+            elif isinstance(item, list):
+                emit(item, path + ("item",), item_location, current_node_id)
             else:
-                row["_".join(path)] = it
+                row["_".join(path)] = item
             rows.append(row)
 
-    def walk(node, path: tuple = ()):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                keyp = path + (k,)
-                if isinstance(v, list): emit(v, keyp)
-                elif isinstance(v, dict): parent_row.update(flatten(v, keyp, {}))
-                else: parent_row["_".join(keyp)] = v
-        elif isinstance(node, list): emit(node, path)
-
-    payload = {k: v for k, v in obj.items() if k not in ("id","versionid","resourceType","meta")}
-    walk(payload)
+    payload = {k: v for k, v in obj.items() if k not in ("id", "versionid", "resourceType")}
+    if isinstance(meta, dict):
+        payload["meta"] = {k: v for k, v in meta.items() if k not in ("versionid", "versionId")}
+    flatten(payload, (), (), parent_row, None)
     return {"parent": [parent_row], "children": children}
 
 def collect_resources_except_bundle(obj: Any, out: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:

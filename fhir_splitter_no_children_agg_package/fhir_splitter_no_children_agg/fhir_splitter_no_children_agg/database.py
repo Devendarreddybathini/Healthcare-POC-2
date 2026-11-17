@@ -5,10 +5,12 @@ import json
 import os
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
     Column,
+    DateTime,
     Index,
     Integer,
     JSON,
@@ -17,7 +19,6 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
-    delete,
     inspect,
     select,
     text,
@@ -25,6 +26,9 @@ from sqlalchemy import (
 )
 
 from .splitter import _normalize_child_basename
+
+
+SCD_COLUMNS = {"meta_versionid", "record_ind", "effective_start_date", "effective_end_date"}
 
 
 def _safe_identifier(value: str) -> str:
@@ -46,12 +50,25 @@ def _collect_table_rows(
     child_prefixes: dict[str, str] = {}
     for resource_type, data in grouped.items():
         parent_table = _safe_identifier(f"fhir_{resource_type}_parent")
-        tables[parent_table].extend(data.get("parent") or [])
+        parents = data.get("parent") or []
+        seen_parents: dict[str, str] = {}
+        for parent in parents:
+            resource_id = parent.get("id")
+            if resource_id is not None:
+                resource_id = str(resource_id)
+                record_hash = _record_hash(parent)
+                if resource_id in seen_parents and seen_parents[resource_id] != record_hash:
+                    raise RuntimeError(
+                        f"Multiple different {resource_type} resources with id {resource_id} "
+                        "were uploaded together. Load each version separately."
+                    )
+                seen_parents[resource_id] = record_hash
+        tables[parent_table].extend(parents)
         child_prefixes[parent_table] = f"fhir_{resource_type}_"
         for child_key, rows in (data.get("children") or {}).items():
             child_name = _normalize_child_basename(resource_type, child_key)
             child_table = _safe_identifier(f"fhir_{child_name}")
-            tables[child_table].extend(rows or [])
+            tables[child_table].extend({**row, "meta_versionid": row.get("meta_versionid")} for row in rows or [])
     return dict(tables), child_prefixes
 
 
@@ -71,24 +88,30 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     for key, value in row.items():
         if key == "_row_id":
             continue
-        if isinstance(value, str) and (key == "__snapshot" or value.lstrip().startswith(("[", "{"))):
+        if key == "__snapshot" and isinstance(value, str):
             try:
-                parsed_value = json.loads(value)
-            except json.JSONDecodeError:
-                pass
-            else:
-                if isinstance(parsed_value, (dict, list)):
-                    value = parsed_value
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Invalid resource snapshot") from exc
+        elif key != "__snapshot":
+            if isinstance(value, (dict, list)):
+                raise ValueError(f"Unnormalized structured value in column {key}")
+            if value is not None and key != "__array_index" and not isinstance(value, str):
+                value = json.dumps(value, ensure_ascii=False)
         normalized[_safe_identifier(str(key))] = value
     if normalized.get("id") is not None:
         normalized["id"] = str(normalized["id"])
+    if normalized.get("meta_versionid") is not None:
+        normalized["meta_versionid"] = str(normalized["meta_versionid"])
     return normalized
 
 
-def _column_type(values: list[Any]):
-    if values and all(value is None or isinstance(value, str) for value in values):
-        return Text()
-    return JSON(none_as_null=True)
+def _column_type(name: str):
+    if name == "__snapshot":
+        return JSON(none_as_null=True)
+    if name == "__array_index":
+        return Integer()
+    return Text()
 
 
 def _ensure_table(
@@ -98,9 +121,10 @@ def _ensure_table(
     is_parent: bool,
 ) -> Table:
     normalized_rows = [_normalize_row(row) for row in rows]
-    column_names = sorted({key for row in normalized_rows for key in row} - {"id", "__record_hash"})
+    excluded = {"id", "__record_hash"} | (SCD_COLUMNS if is_parent else set())
+    column_names = sorted({key for row in normalized_rows for key in row} - excluded)
     column_types = {
-        name: _column_type([row.get(name) for row in normalized_rows])
+        name: _column_type(name)
         for name in column_names
     }
     metadata = MetaData()
@@ -110,6 +134,15 @@ def _ensure_table(
     ]
     if is_parent:
         columns.append(Column("__record_hash", String(64), nullable=True))
+    if is_parent:
+        columns.extend(
+            [
+                Column("meta_versionid", String(64), nullable=True),
+                Column("record_ind", String(1), nullable=True),
+                Column("effective_start_date", DateTime, nullable=True),
+                Column("effective_end_date", DateTime, nullable=True),
+            ]
+        )
     columns.extend(Column(name, column_types[name], nullable=True) for name in column_names)
     Table(table_name, metadata, *columns).create(connection, checkfirst=True)
 
@@ -154,6 +187,26 @@ def _ensure_table(
         )
         column_info.add("__record_hash")
 
+    scd_definitions = {
+        "meta_versionid": "VARCHAR(64)",
+        "record_ind": "VARCHAR(1)",
+        "effective_start_date": "DATETIME",
+        "effective_end_date": "DATETIME",
+    }
+    for scd_name, scd_type in (scd_definitions.items() if is_parent else ()):
+        if scd_name not in column_info:
+            connection.execute(
+                text(f"ALTER TABLE {quoted_table} ADD COLUMN {preparer.quote(scd_name)} {scd_type} NULL")
+            )
+            if scd_name == "effective_start_date":
+                # rows loaded before SCD2 support become the current version
+                connection.execute(
+                    text(
+                        f"UPDATE {quoted_table} SET record_ind = 'Y', effective_start_date = :now "
+                        f"WHERE record_ind IS NULL"
+                    ),
+                    {"now": datetime.now(timezone.utc).replace(tzinfo=None)},
+                )
     column_info = {column["name"]: column for column in inspect(connection).get_columns(table_name)}
     for column_name in column_names:
         quoted_column = preparer.quote(column_name)
@@ -193,55 +246,86 @@ def _ensure_table(
 
 
 def _ensure_parent_id_index(connection, table: Table) -> None:
-    inspector = inspect(connection)
-    indexes = inspector.get_indexes(table.name)
-    if any(index["unique"] and index["column_names"] == ["id"] for index in indexes):
-        return
-
-    preparer = connection.dialect.identifier_preparer
-    quoted_table = preparer.quote(table.name)
-    quoted_id = preparer.quote("id")
-    quoted_row_id = preparer.quote("_row_id")
-    connection.execute(
-        text(
-            f"DELETE FROM {quoted_table} WHERE {quoted_id} IS NOT NULL "
-            f"AND {quoted_row_id} NOT IN (SELECT keep_row FROM "
-            f"(SELECT MAX({quoted_row_id}) AS keep_row FROM {quoted_table} "
-            f"WHERE {quoted_id} IS NOT NULL GROUP BY {quoted_id}) AS latest_rows)"
-        )
-    )
-    index_name = _safe_identifier(f"uq_{table.name}_id")
-    Index(index_name, table.c.id, unique=True).create(connection, checkfirst=True)
+    # SCD2 keeps several versions per id, so id can no longer be unique.
+    for index in inspect(connection).get_indexes(table.name):
+        if index["unique"] and index["column_names"] == ["id"]:
+            Index(index["name"], table.c.id, unique=True).drop(connection)
+    index_name = _safe_identifier(f"ix_{table.name}_id")
+    Index(index_name, table.c.id).create(connection, checkfirst=True)
 
 
-def _upsert_parent(connection, table: Table, row: dict[str, Any]) -> None:
-    updates = {
-        key: value
-        for key, value in row.items()
-        if key not in ("id", "_row_id")
-    }
-    dialect = connection.dialect.name
-    if dialect == "mysql":
-        from sqlalchemy.dialects.mysql import insert
+def _next_version(existing_versions: list[Any]) -> str:
+    numeric = []
+    for version in existing_versions:
+        try:
+            numeric.append(int(str(version)))
+        except (TypeError, ValueError):
+            pass
+    return str((max(numeric) if numeric else len(existing_versions)) + 1)
 
-        statement = insert(table).values(**row)
-        connection.execute(statement.on_duplicate_key_update(**updates))
-    elif dialect == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert
 
-        statement = insert(table).values(**row)
-        connection.execute(
-            statement.on_conflict_do_update(
-                index_elements=[table.c.id],
-                set_={key: statement.excluded[key] for key in updates},
+def _scd2_plan(connection, table: Table, rows_by_id: dict[str, dict[str, Any]]):
+    """Decide per id whether to insert a new version. Returns (rows to insert, versions by id, new ids, updated ids)."""
+    existing: dict[str, list[Any]] = defaultdict(list)
+    if rows_by_id:
+        for rid, version, record_hash, record_ind in connection.execute(
+            select(table.c.id, table.c.meta_versionid, table.c.__record_hash, table.c.record_ind).where(
+                table.c.id.in_(list(rows_by_id))
             )
-        )
-    else:
-        row_id = connection.execute(select(table.c._row_id).where(table.c.id == row["id"])).scalar_one_or_none()
-        if row_id is None:
-            connection.execute(table.insert().values(**row))
+        ).all():
+            existing[rid].append((None if version is None else str(version), record_hash, record_ind))
+
+    to_insert: list[dict[str, Any]] = []
+    versions: dict[str, str] = {}
+    unchanged: set[str] = set()
+    updated: set[str] = set()
+    for rid, row in rows_by_id.items():
+        history = existing.get(rid, [])
+        incoming_version = row.get("meta_versionid")
+        if incoming_version is not None:
+            # versioned resource: a version already stored is never reloaded
+            if any(version == incoming_version for version, _, _ in history):
+                unchanged.add(rid)
+                versions[rid] = incoming_version
+                continue
         else:
-            connection.execute(update(table).where(table.c._row_id == row_id).values(**updates))
+            current = [h for h in history if h[2] == "Y"]
+            if current and current[0][1] == row["__record_hash"]:
+                unchanged.add(rid)
+                versions[rid] = current[0][0]
+                continue
+            row["meta_versionid"] = _next_version([version for version, _, _ in history])
+        versions[rid] = row["meta_versionid"]
+        if history:
+            updated.add(rid)
+        to_insert.append(row)
+    return to_insert, versions, unchanged, updated
+
+
+def _child_row_key(table: Table, row: dict[str, Any]) -> str:
+    values = {
+        column.name: row.get(column.name)
+        for column in table.columns
+        if column.name not in {"_row_id", "record_ind", "effective_start_date", "effective_end_date"}
+    }
+    return json.dumps(values, sort_keys=True, default=str, ensure_ascii=False)
+
+def _match_column_types(table: Table, row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: json.dumps(value, ensure_ascii=False)
+        if isinstance(table.c[key].type, Text) and isinstance(value, (dict, list))
+        else value
+        for key, value in row.items()
+    }
+
+
+def _expire_active(connection, table: Table, ids: set[str], now: datetime) -> None:
+    if ids:
+        connection.execute(
+            update(table)
+            .where(table.c.id.in_(list(ids)), table.c.record_ind == "Y")
+            .values(record_ind="N", effective_end_date=now)
+        )
 
 
 def save_grouped_resources(grouped: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -289,6 +373,7 @@ def save_grouped_resources(grouped: dict[str, dict[str, Any]]) -> dict[str, Any]
 
             changed_ids_by_parent: dict[str, set[str]] = {}
             unchanged_ids_by_parent: dict[str, set[str]] = {}
+            versions_by_parent: dict[str, dict[str, str]] = {}
             parent_rows_to_save: dict[str, list[dict[str, Any]]] = {}
             for parent_table in parent_tables:
                 rows_by_id: dict[str, dict[str, Any]] = {}
@@ -302,50 +387,30 @@ def save_grouped_resources(grouped: dict[str, dict[str, Any]]) -> dict[str, Any]
                         rows_by_id[row["id"]] = row
 
                 table = tables[parent_table]
-                ids = list(rows_by_id)
-                existing_hashes = {}
-                if ids:
-                    existing_hashes = dict(
-                        connection.execute(
-                            select(table.c.id, table.c.__record_hash).where(table.c.id.in_(ids))
-                        ).all()
-                    )
-
-                changed_ids = set()
-                rows_to_save = []
-                for resource_id, row in rows_by_id.items():
-                    if existing_hashes.get(resource_id) == row["__record_hash"]:
-                        unchanged_rows += 1
-                    else:
-                        changed_ids.add(resource_id)
-                        rows_to_save.append(row)
-                        if resource_id in existing_hashes:
-                            updated_rows += 1
-                        else:
-                            inserted_rows += 1
+                rows_to_save, versions, unchanged_ids, updated_ids = _scd2_plan(connection, table, rows_by_id)
+                changed_ids = {row["id"] for row in rows_to_save}
+                unchanged_rows += len(unchanged_ids)
+                updated_rows += len(updated_ids)
+                inserted_rows += len(changed_ids) - len(updated_ids)
                 for row in rows_without_id:
                     row["__record_hash"] = _record_hash(row)
                     rows_to_save.append(row)
                     inserted_rows += 1
 
                 changed_ids_by_parent[parent_table] = changed_ids
-                unchanged_ids_by_parent[parent_table] = set(rows_by_id) - changed_ids
+                unchanged_ids_by_parent[parent_table] = unchanged_ids
+                versions_by_parent[parent_table] = versions
                 parent_rows_to_save[parent_table] = rows_to_save
 
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             for parent_table, changed_ids in changed_ids_by_parent.items():
-                if not changed_ids:
-                    continue
-                for child_table in child_tables_by_parent[parent_table]:
-                    table = tables[child_table]
-                    connection.execute(delete(table).where(table.c.id.in_(changed_ids)))
+                _expire_active(connection, tables[parent_table], changed_ids, now)
 
+            scd_values = {"record_ind": "Y", "effective_start_date": now, "effective_end_date": None}
             for parent_table, rows in parent_rows_to_save.items():
                 table = tables[parent_table]
                 for row in rows:
-                    if row.get("id") is None:
-                        connection.execute(table.insert().values(**row))
-                    else:
-                        _upsert_parent(connection, table, row)
+                    connection.execute(table.insert().values(**_match_column_types(table, row), **scd_values))
 
             for table_name, source_rows in table_rows.items():
                 if table_name in parent_tables:
@@ -355,14 +420,27 @@ def save_grouped_resources(grouped: dict[str, dict[str, Any]]) -> dict[str, Any]
                     (parent for parent, prefix in child_prefixes.items() if table_name.startswith(prefix)),
                     None,
                 )
-                changed_ids = changed_ids_by_parent.get(parent_table or "", set())
+                if parent_table is None:
+                    raise RuntimeError(f"No parent table found for child table {table_name}")
+                changed_ids = changed_ids_by_parent[parent_table]
+                seen: set[str] = set()
+                if changed_ids:
+                    for existing_row in connection.execute(
+                        select(table).where(table.c.id.in_(list(changed_ids)))
+                    ).mappings():
+                        seen.add(_child_row_key(table, dict(existing_row)))
                 for source_row in source_rows:
                     row = _normalize_row(source_row)
                     resource_id = row.get("id")
                     if resource_id is not None and resource_id not in changed_ids:
-                        if resource_id in unchanged_ids_by_parent.get(parent_table or "", set()):
-                            unchanged_rows += 1
                         continue
+                    if resource_id is not None:
+                        row["meta_versionid"] = versions_by_parent[parent_table][resource_id]
+                    row = _match_column_types(table, row)
+                    key = _child_row_key(table, row)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     connection.execute(table.insert().values(**row))
                     inserted_rows += 1
     finally:
